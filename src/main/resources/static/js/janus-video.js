@@ -12,6 +12,8 @@ janus.video.makeRoom = function(janusConfig) {
 
 janus.video.Room = function(janusConfig) {
     this.janus = null;
+    this.rooms = null;
+    this.room = {'id' : 1234};
     this.startMuted = false;
     this.subscribeToFeeds = null;
 
@@ -32,8 +34,18 @@ janus.video.Room = function(janusConfig) {
     if (janusConfig.joinUnmutedLimit) {
         this.joinUnmutedLimit = janusConfig.joinUnmutedLimit;
     }
-    this.connect_();
-    this.enter_("Kotaro");
+
+    var that = this;
+
+/*    this.connect_().then(function () {
+        that.getRooms_().then(function (rooms) {
+            that.rooms = rooms;
+        });
+    });*/
+
+    this.connect_().then(function () {
+        that.enter_("Kotaro");
+    });
 };
 
 janus.video.Room.prototype.defaultJanusServer_ = function() {
@@ -46,58 +58,127 @@ janus.video.Room.prototype.defaultJanusServer_ = function() {
 };
 
 janus.video.Room.prototype.connect_ = function() {
-    if (this.janus === null) {
-        Janus.init({debug: this.janusDebug});
-        this.janus = new Janus({
-            server: this.server,
-            success: function () {
-            },
-            error: function (error) {
-                var msg = "Janus error: " + error;
-                msg += "\nDo you want to reload in order to retry?";
-                if (window.confirm(msg)) {
-                    window.location.reload();
-                }
-            },
-            destroyed: function () {
-                console.log("Janus object destroyed");
+    var that = this;
+    return new Promise(function (resolve, reject) {
+      if (that.janus === null) {
+        Janus.init({debug: that.janusDebug});
+        that.janus = new Janus({
+          server: that.server,
+          success: function () {
+            resolve();
+          },
+          error: function (error) {
+            var msg = "Janus error: " + error;
+            msg += "\nDo you want to reload in order to retry?";
+            reject();
+            if (window.confirm(msg)) {
+              window.location.reload();
+            }
+          },
+          destroyed: function () {
+            console.log("Janus object destroyed");
+          }
+        });
+      } else {
+        resolve();
+      }
+    });
+};
+
+janus.video.Room.prototype.createRoom_ = function() {
+    var that = this;
+    return new Promise(function (resolve, reject) {
+        that.janus.attach({
+            plugin: 'janus.plugin.videoroom',
+            success: function (pluginHandle) {
+                var create = { 'request': 'create', 'description': 'My demo room', 'bitrate': 0, 'publishers': 1 };
+                pluginHandle.send({
+                    'message': create,
+                    success: function (result) {
+                        var event = result['videoroom'];
+                        Janus.debug('Event: ' + event);
+                        if(event != undefined && event != null) {
+                            // Our own screen sharing session has been created, join it
+                            var room = result['room'];
+                            Janus.log('Screen sharing session created: ' + room);
+                            var myusername = 'Kotaro';
+                            var register = { 'request': 'join', 'room': room, 'ptype': 'publisher', 'display': myusername };
+                            pluginHandle.send({'message': register});
+                            resolve(result);
+                        } else {
+                            reject();
+                        }
+                    }
+                });
+            }
+        })
+    });
+};
+
+janus.video.Room.prototype.getRooms_ = function() {
+    var that = this;
+    return new Promise(function (resolve, reject) {
+        // Create a new session just to get the list
+        that.janus.attach({
+            plugin: 'janus.plugin.videoroom',
+            success: function (pluginHandle) {
+                console.log('getAvailableRooms plugin attached (' + pluginHandle.getPlugin() + ', id=' + pluginHandle.getId() + ')');
+                var request = {'request': 'list'};
+                pluginHandle.send({
+                    'message': request, success: function (result) {
+                        // Free the resource (it looks safe to do it here)
+                        pluginHandle.detach();
+
+                        if (result.videoroom === 'success') {
+/*                            var rooms = _.map(result.list, function (r) {
+                                return new Room(r);
+                            });*/
+                            resolve(result.list);
+                        } else {
+                            reject();
+                        }
+                    }
+                });
             }
         });
-    }
+    });
 };
 
 janus.video.Room.prototype.enter_ = function(username) {
     // Create new session
+    var that = this;
     this.janus.attach({
-        plugin: "janus.plugin.videoroom",
+        plugin: 'janus.plugin.videoroom',
         success: function(pluginHandle) {
             // Step 1. Right after attaching to the plugin, we send a
             // request to join
-            this.connection = new janus.video.FeedConnection(pluginHandle, this.room.id, "main");
-            this.connection.register(username);
+            that.connection = new janus.video.FeedConnection(pluginHandle, that.room.id, 'main');
+            that.connection.register(username);
         },
         error: function(error) {
-            console.error("Error attaching plugin... " + error);
+            console.error('Error attaching plugin... ' + error);
         },
         consentDialog: function(on) {
             console.log("Consent dialog should be " + (on ? "on" : "off") + " now");
             //$$rootScope.$broadcast('consentDialog.changed', on);
             if(!on){
                 //notify if joined muted
-                if (this.startMuted) {
+                if (that.startMuted) {
                     //$$rootScope.$broadcast('muted.Join');
                 }
             }
         },
         ondataopen: function() {
             console.log("The publisher DataChannel is available");
-            this.connection.onDataOpen();
+            that.connection.onDataOpen();
         },
         onlocalstream: function(stream) {
             // Step 4b (parallel with 4a).
             // Send the created stream to the UI, so it can be attached to
             // some element of the local DOM
             console.log(" ::: Got a local stream :::");
+            var video = goog.dom.getElement('main-video');
+            Janus.attachMediaStream(video, stream);
         },
         oncleanup: function () {
             console.log(" ::: Got a cleanup notification: we are unpublished now :::");
@@ -107,25 +188,25 @@ janus.video.Room.prototype.enter_ = function(username) {
             var event = msg.videoroom;
             console.log("Event: " + event);
 
-            var _connection = this.connection;
+            var _connection = that.connection;
             // Step 2. Response from janus confirming we joined
             if (event === "joined") {
                 console.log("Successfully joined room " + msg.room);
                 // Step 3. Establish WebRTC connection with the Janus server
                 // Step 4a (parallel with 4b). Publish our feed on server
 
-                if (this.joinUnmutedLimit !== undefined && this.joinUnmutedLimit !== null) {
-                    this.startMuted = (msg.publishers instanceof Array) && msg.publishers.length >= this.joinUnmutedLimit;
+                if (that.joinUnmutedLimit !== undefined && that.joinUnmutedLimit !== null) {
+                    that.startMuted = (msg.publishers instanceof Array) && msg.publishers.length >= that.joinUnmutedLimit;
                 }
 
-                this.connection.publish({
-                    muted: this.startMuted,
-                    error: function() { _connection.publish({noCamera: true, muted: this.startMuted}); }
+                that.connection.publish({
+                    muted: that.startMuted,
+                    error: function() { _connection.publish({noCamera: true, muted: that.startMuted}); }
                 });
 
                 // Step 5. Attach to existing feeds, if any
                 if ((msg.publishers instanceof Array) && msg.publishers.length > 0) {
-                    this.subscribeToFeeds(msg.publishers, this.room.id);
+                    that.subscribeToFeeds(msg.publishers, that.room.id);
                 }
                 // The room has been destroyed
             } else if (event === "destroyed") {
@@ -134,7 +215,7 @@ janus.video.Room.prototype.enter_ = function(username) {
             } else if (event === "event") {
                 // Any new feed to attach to?
                 if ((msg.publishers instanceof Array) && msg.publishers.length > 0) {
-                    this.subscribeToFeeds(msg.publishers, that.room.id);
+                    that.subscribeToFeeds(msg.publishers, that.room.id);
                     // One of the publishers has gone away?
                 } else if(msg.leaving !== undefined && msg.leaving !== null) {
                     var leaving = msg.leaving;
@@ -145,7 +226,7 @@ janus.video.Room.prototype.enter_ = function(username) {
                     //ActionService.destroyFeed(unpublished);
                     // Reply to a configure request
                 } else if (msg.configured) {
-                    this.connection.confirmConfig();
+                    that.connection.confirmConfig();
                     // The server reported an error
                 } else if(msg.error !== undefined && msg.error !== null) {
                     console.log("Error message from server" + msg.error);
@@ -154,7 +235,7 @@ janus.video.Room.prototype.enter_ = function(username) {
             }
 
             if (jsep !== undefined && jsep !== null) {
-                this.connection.handleRemoteJsep(jsep);
+                that.connection.handleRemoteJsep(jsep);
             }
         }
     });
@@ -321,6 +402,7 @@ janus.video.ConnectionConfig = function(pluginHandle, wantedInit, jsep, ok) {
     this.requested = null;
     this.wanted = {audio: true, video: true};
     this.okCallback = null;
+    this.pluginHandle = pluginHandle;
     //_.assign(wanted, wantedInit);
     // Initial configure
     this.configure_({jsep: jsep, ok: ok});

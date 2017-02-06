@@ -5,6 +5,7 @@
 </head>
 <body>
 Hey!!!!
+    <video id="main-video" width="100%" height="100%" autoplay muted="muted" />
 </body>
 <script type="text/javascript" src="/js/vendor/adapter.js" ></script>
 <script type="text/javascript" src="/js/vendor/janus.nojquery.js" ></script>
