@@ -9,13 +9,13 @@ janus.video.makeRoom = function(janusConfig) {
     return new janus.video.Room(janusConfig);
 };
 
-
 janus.video.Room = function(janusConfig) {
     this.janus = null;
-    this.rooms = null;
     this.room = {'id' : 1234};
     this.startMuted = false;
-    this.subscribeToFeeds = null;
+    this.feeds = {};
+    this.entries = {};
+    this.mainFeed = null;
 
     if (janusConfig.janusServer) {
         this.server = janusConfig.janusServer;
@@ -206,7 +206,7 @@ janus.video.Room.prototype.enter_ = function(username) {
 
                 // Step 5. Attach to existing feeds, if any
                 if ((msg.publishers instanceof Array) && msg.publishers.length > 0) {
-                    that.subscribeToFeeds(msg.publishers, that.room.id);
+                    that.subscribeToFeeds_(msg.publishers, that.room.id);
                 }
                 // The room has been destroyed
             } else if (event === "destroyed") {
@@ -215,7 +215,7 @@ janus.video.Room.prototype.enter_ = function(username) {
             } else if (event === "event") {
                 // Any new feed to attach to?
                 if ((msg.publishers instanceof Array) && msg.publishers.length > 0) {
-                    that.subscribeToFeeds(msg.publishers, that.room.id);
+                    that.subscribeToFeeds_(msg.publishers, that.room.id);
                     // One of the publishers has gone away?
                 } else if(msg.leaving !== undefined && msg.leaving !== null) {
                     var leaving = msg.leaving;
@@ -240,6 +240,223 @@ janus.video.Room.prototype.enter_ = function(username) {
         }
     });
 
+};
+
+janus.video.Room.prototype.findFeed_ = function(id) {
+    return (this.feeds[id] || null);
+};
+
+janus.video.Room.prototype.addFeed_ = function(feed, options) {
+    this.feeds[feed.id] = feed;
+    if (options && options.main) {
+        this.mainFeed = feed;
+    }
+};
+
+janus.video.Room.prototype.findMain_ = function() {
+    return this.mainFeed;
+};
+
+
+janus.video.Room.prototype.remoteJoin_ = function(feedId, display, connection) {
+    var feed = new janus.video.Feed({
+        display: display,
+        connection: connection,
+        id: feedId,
+        isPublisher: false
+    });
+    this.addFeed_(feed);
+};
+
+janus.video.Room.prototype.waitFor_ = function(id, attempts, timeout) {
+    var that = this;
+    return new Promise(function (resolve, reject) {
+        var feed = this.findFeed_(id);
+        attempts = attempts || 10;
+        timeout = timeout || 1000;
+
+        if (feed === null) { // If feed is not found, set an interval to check again.
+            var interval = setInterval(function () {
+                feed = that.findFeed_(id);
+                if (feed === null) { // The feed was not found this time
+                    attempts -= 1;
+                } else { // The feed was finally found
+                    clearInterval(interval);
+                    resolve(feed);
+                }
+                if (attempts === 0) { // No more attempts left and feed was not found
+                    clearInterval(interval);
+                    reject("feed with id " + id + " was not found");
+                }
+            }, timeout);
+        } else {
+            resolve(feed);
+        }
+    });
+};
+
+janus.video.Room.prototype.subscribeToFeeds_ = function(list) {
+    console.log("Got a list of available publishers/feeds:");
+    console.log(list);
+    for (var f = 0; f < list.length; f++) {
+        var id = list[f].id;
+        var display = list[f].display;
+        console.log("  >> [" + id + "] " + display);
+        var feed = this.findFeed_(id);
+        if (feed === null || feed.waitingForConnection()) {
+            this.subscribeToFeed_(id, display);
+        }
+    }
+};
+
+janus.video.Room.prototype.subscribeToFeed_ = function(id, display) {
+    var feed = this.findFeed_(id);
+    var connection = null;
+
+    if (feed) {
+        display = feed.display;
+    }
+
+    var that = this;
+    this.janus.attach({
+        plugin: "janus.plugin.videoroom",
+        success: function(pluginHandle) {
+            connection = new janus.video.FeedConnection(pluginHandle, that.room.id, 'subscriber');
+            connection.listen(id);
+        },
+        error: function(error) {
+            console.error("  -- Error attaching plugin... " + error);
+        },
+        onmessage: function(msg, jsep) {
+            console.log(" ::: Got a message (listener) :::");
+            console.log(JSON.stringify(msg));
+            var event = msg.videoroom;
+            console.log("Event: " + event);
+            if (event === "attached") {
+                // Subscriber created and attached
+                setTimeout(function() {
+                    if (feed) {
+                        var thisFeed = that.findFeed_(id);
+                        if (thisFeed !== null) {
+                            thisFeed.stopIgnoring(connection);
+                        }
+                    } else {
+                        that.remoteJoin_(id, display, connection);
+                    }
+                    console.log("Successfully attached to feed " + id + " (" + display + ") in room " + msg.room);
+                });
+            } else if (msg.configured) {
+                connection.confirmConfig();
+            } else if (msg.started) {
+                // Initial setConfig, needed to complete all the initializations
+                connection.setConfig({values: {audio: true, video: true}});
+            } else {
+                console.log("What has just happened?!");
+            }
+
+            if(jsep !== undefined && jsep !== null) {
+                connection.subscribe(jsep);
+            }
+        },
+        onremotestream: function(stream) {
+            that.waitFor_(id).then(function (feed) {
+                feed.setStream(stream);
+
+            }, function (reason) {
+                console.error(reason);
+            });
+        },
+        ondataopen: function() {
+            console.log("The subscriber DataChannel is available");
+            connection.onDataOpen();
+            // Send status information of all our feeds to inform the newcommer
+            this.sendStatus_();
+        },
+        ondata: function(data) {
+            console.log(" ::: Got info in the data channel (subscriber) :::");
+            this.receiveMessage_(data, id);
+        },
+        oncleanup: function() {
+            console.log(" ::: Got a cleanup notification (remote feed " + id + ") :::");
+        }
+    });
+};
+
+janus.video.Room.prototype.receiveMessage_ = function(data, remoteId) {
+    var msg = JSON.parse(data);
+    var type = msg.type;
+    var content = msg.content;
+    var feed;
+    var logEntry;
+
+    if (type === "chatMsg") {
+        logEntry = new janus.video.LogEntry("chatMsg", {feed: this.findFeed_(remoteId), text: content});
+        if (logEntry.hasText()) {
+            this.addLogEntry(logEntry)
+        }
+    } else if (type === "muteRequest") {
+        feed = this.findFeed_(content.target);
+        if (feed.isPublisher) {
+            feed.setEnabledChannel("audio", false, {after:
+                function() { $rootScope.$broadcast('muted.byRequest'); }
+            });
+        }
+        // Log the event
+        logEntry = new LogEntry("muteRequest", {source: FeedsService.find(remoteId), target: feed});
+        LogService.add(logEntry);
+    } else if (type === "statusUpdate") {
+        feed = FeedsService.find(content.source);
+        if (feed && !feed.isPublisher) {
+            feed.setStatus(content.status);
+        }
+    } else {
+        console.log("Unknown data type: " + type);
+    }
+}
+
+janus.video.Room.prototype.sendMuteRequest_ = function(feed) {
+    var content = {
+        target: feed.id
+    };
+    this.sendMessage_("muteRequest", content);
+};
+
+janus.video.Room.prototype.sendStatus_ = function(feed, statusOptions) {
+    var content = {
+        source: feed.id,
+        status: feed.getStatus(statusOptions)
+    };
+    this.sendMessage_("statusUpdate", content);
+};
+
+janus.video.Room.prototype.sendChatMessage_ = function(text) {
+    this.sendMessage_("chatMsg", text);
+};
+
+janus.video.Room.prototype.sendMessage_ = function(type, content) {
+    var text = JSON.stringify({
+        type: type,
+        content: content
+    });
+    var mainFeed = this.findMain_();
+    if (mainFeed === null) { return; }
+    if (!mainFeed.isDataOpen()) {
+        console.log("Data channel not open yet. Skipping");
+        return;
+    }
+    var connection = mainFeed.connection;
+    connection.sendData({
+        text: text,
+        error: function(reason) { alert(reason); },
+        success: function() { console.log("Data sent: " + type); }
+    });
+};
+
+janus.video.Room.prototype.addLogEntry = function(entry) {
+    var that = this;
+    setTimeout(function () {
+        that.entries.push(entry);
+    });
 };
 
 janus.video.FeedConnection = function (pluginHandle, roomId, role) {
@@ -484,4 +701,63 @@ janus.video.ConnectionConfig.prototype.configure_ = function(options) {
             console.error("Config request not sent");
         }
     });
+};
+
+janus.video.Feed = function (attrs) {
+    this.id = attrs.id || 0;
+    this.display = attrs.display || null;
+    this.isPublisher = attrs.isPublisher || false;
+    this.isLocalScreen = attrs.isLocalScreen || false;
+    this.isIgnored = attrs.ignored || false;
+    this.connection = attrs.connection || null;
+};
+
+janus.video.Feed.prototype.isConnected = function() {
+    return (this.connection !== null);
+};
+
+janus.video.Feed.prototype.disconnect = function() {
+    if (this.connection) {
+        this.connection.destroy();
+    }
+/*    if (speakObserver) {
+        speakObserver.destroy();
+    }*/
+    this.connection = null;
+};
+
+janus.video.Feed.prototype.setStream = function(stream) {
+    var video = goog.dom.createDom('video', {'autoplay' : '', 'muted' : 'muted',
+        'style': 'width: 160px; height: 120px; border: 1px solid black;'});
+    var parent = goog.dom.getElement('listeners');
+    goog.dom.appendChild(parent, video);
+    Janus.attachMediaStream(video, stream);
+};
+
+janus.video.Feed.prototype.ignore = function() {
+    this.isIgnored = true;
+    this.disconnect();
+};
+
+janus.video.Feed.prototype.stopIgnoring = function(connection) {
+    this.isIgnored = false;
+    this.connection = connection;
+};
+
+janus.video.Feed.prototype.waitingForConnection = function() {
+    return (this.isIgnored === false && !this.connection);
+};
+
+janus.video.LogEntry = function(type, content) {
+    this.type = type;
+    this.timestamp = new Date();
+    this.content = content || {};
+};
+
+janus.video.LogEntry.prototype.text = function() {
+    return this[this.type + "Text"]();
+};
+
+janus.video.LogEntry.prototype.hasText = function() {
+    return this.text() !== "";
 };
